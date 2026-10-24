@@ -1,0 +1,38 @@
+name: Keepalive
+on:
+  schedule:
+    - cron: '0 9 * * *'   # once a day, 09:00 UTC
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Auto-renew before GitHub's 60-day auto-disable
+        env:
+          TELEGRAM_BOT_API_KEY: ${{ secrets.TELEGRAM_BOT_API_KEY }}
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+        run: |
+          LAST=$(git log -1 --format=%ct)
+          NOW=$(date +%s)
+          DAYS=$(( (NOW - LAST) / 86400 ))
+          echo "Days since last commit: $DAYS"
+          notify() {
+            curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_API_KEY}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_USER_ID}" \
+              --data-urlencode "text=$1" >/dev/null
+          }
+          if [ "$DAYS" -ge 50 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keepalive (reset 60-day scheduler clock)"
+            if git push; then
+              notify "Auto-renewed your OCI grabber ($DAYS days idle): pushed an empty commit to reset GitHub's 60-day scheduler clock. Still polling, no action needed."
+            else
+              notify "WARNING: tried to auto-renew the OCI grabber but the push failed. Please push any commit to your fork manually so the scheduled workflow isn't disabled."
+            fi
+          fi
