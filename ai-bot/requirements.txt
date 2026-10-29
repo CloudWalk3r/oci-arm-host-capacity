@@ -1,0 +1,11 @@
+# [job-queue] adds APScheduler, used for /watch daily price checks.
+python-telegram-bot[job-queue]==21.6
+openai==1.54.4
+# Pin httpx to 0.27.x: httpx>=0.28 removed the `proxies` arg that openai 1.54.x passes.
+httpx==0.27.2
+# /search web results (no API key needed)
+ddgs==9.16.1
+# /summarize URL text extraction
+beautifulsoup4==4.12.3
+# /dl: drive JDownloader 2 over the MyJDownloader API (FuckingFast/DataNodes/FileKeeper)
+myjdapi==1.1.9

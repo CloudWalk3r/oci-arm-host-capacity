@@ -1,0 +1,60 @@
+title = "oci-arm-host-capacity secret scan"
+
+# Start from gitleaks' built-in rules (private keys, GitHub tokens, GCP keys, ...).
+[extend]
+useDefault = true
+
+[[rules]]
+id = "telegram-bot-token"
+description = "Telegram bot token"
+regex = '''\b\d{8,10}:AA[0-9A-Za-z_-]{33}\b'''
+keywords = [":aa"]
+
+[[rules]]
+id = "groq-api-key"
+description = "Groq API key"
+regex = '''\bgsk_[A-Za-z0-9]{40,}\b'''
+keywords = ["gsk_"]
+
+[[rules]]
+id = "google-ai-studio-key"
+description = "Google AI Studio (Gemini) API key"
+regex = '''\bAQ\.[A-Za-z0-9_-]{30,}'''
+keywords = ["aq."]
+
+[[rules]]
+id = "oci-user-tenancy-ocid"
+description = "OCI user or tenancy OCID"
+regex = '''\bocid1\.(?:user|tenancy)\.oc1\.\.[a-z0-9]{40,}\b'''
+keywords = ["ocid1."]
+
+[[rules]]
+id = "oci-api-key-fingerprint"
+description = "OCI API signing key fingerprint"
+regex = '''\b(?:[0-9a-f]{2}:){15}[0-9a-f]{2}\b'''
+
+[[rules]]
+id = "env-file-credential"
+description = "Credential-like variable with a value in an .env-style file"
+path = '''(?i)(?:^|/)\.env[^/]*$'''
+regex = '''(?im)^[ \t]*[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|HASH)[A-Z0-9_]*[ \t]*=[ \t]*["']?([^\s"'#]+)'''
+secretGroup = 1
+[[rules.allowlists]]
+description = "Public keys and key file paths are not secrets"
+regexTarget = "match"
+regexes = ['''(?i)PUBLIC_KEY|_FILENAME|_FILE[ \t]*=|_PATH[ \t]*=''']
+
+# Upstream test fixtures use fake OCIDs/fingerprints; example files mask real values with ***.
+[[allowlists]]
+description = "Upstream test fixtures"
+paths = ['''^tests/''']
+
+[[allowlists]]
+description = "Empty assignment; the built-in generic rule otherwise reads the next line as its value"
+regexTarget = "match"
+regexes = ['''=[ \t]*\r?\n''']
+
+[[allowlists]]
+description = "Masked placeholder values"
+regexTarget = "secret"
+regexes = ['''\*\*\*''']

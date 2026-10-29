@@ -1,0 +1,190 @@
+name: Deploy bot
+on:
+  push:
+    branches: [main]
+    paths:
+      - "ai-bot/**"
+      - ".github/workflows/deploy-bot.yml"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Instance to deploy to (a key of the DEPLOY_HOSTS secret)
+        type: choice
+        options: [micro1, micro2, arm1, arm2]
+        default: micro1
+      image_tag:
+        description: Deploy this existing image tag instead of building (e.g. sha-1a2b3c4), for rollback
+        type: string
+        required: false
+permissions:
+  contents: read
+  packages: write
+env:
+  IMAGE: ghcr.io/cloudwalk3r/ai-bot
+jobs:
+  secret-scan:
+    uses: ./.github/workflows/secret-scan.yml
+
+  build:
+    needs: secret-scan
+    if: ${{ !inputs.image_tag }}
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: meta
+        run: echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Micros are amd64, the A1.Flex boxes are arm64: one multi-arch image runs on all four.
+      - uses: docker/build-push-action@v6
+        with:
+          context: ai-bot
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+            ${{ env.IMAGE }}:latest
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: [secret-scan, build]
+    # Runs after a successful build, or straight after the scan when redeploying an existing tag.
+    if: >-
+      ${{ always() && needs.secret-scan.result == 'success' &&
+          (needs.build.result == 'success' || (needs.build.result == 'skipped' && inputs.image_tag != '')) }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-${{ inputs.target || vars.DEFAULT_DEPLOY_TARGET }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve target instance and image tag
+        id: target
+        env:
+          TARGET: ${{ inputs.target || vars.DEFAULT_DEPLOY_TARGET }}
+          # A secret, not a variable: this repo is public and so are its Actions logs.
+          HOSTS: ${{ secrets.DEPLOY_HOSTS }}
+          TAG: ${{ inputs.image_tag || needs.build.outputs.tag }}
+        run: |
+          if [ -z "$TARGET" ]; then
+            echo "::error::No target instance. Set the DEFAULT_DEPLOY_TARGET repo variable (e.g. micro1)."; exit 1
+          fi
+          [ -n "$HOSTS" ] || HOSTS='{}'
+          host=$(jq -r --arg t "$TARGET" '.[$t] // empty' <<< "$HOSTS")
+          if [ -z "$host" ]; then
+            echo "::error::'$TARGET' is not in the DEPLOY_HOSTS secret (JSON map of name -> IP)."; exit 1
+          fi
+          echo "::add-mask::$host"
+          if ! [[ "$TAG" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Invalid image tag '$TAG'."; exit 1
+          fi
+          echo "name=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "host=$host" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Deploying $IMAGE:$TAG to $TARGET"
+
+      - name: Install SSH key
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then echo "::error::DEPLOY_SSH_KEY secret is not set."; exit 1; fi
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Deploy and health-check
+        env:
+          HOST: ${{ steps.target.outputs.host }}
+          TAG: ${{ steps.target.outputs.tag }}
+          SSH_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ssh_opts=(-i ~/.ssh/deploy_key -o BatchMode=yes -o StrictHostKeyChecking=accept-new
+                    -o ConnectTimeout=30 -o ServerAliveInterval=10 -o ServerAliveCountMax=6)
+          dest="$SSH_USER@$HOST"
+
+          # The micros drop SSH handshakes under memory pressure: retry connection failures
+          # (exit 255) only, so real deploy errors fail fast.
+          retry() {
+            local rc
+            for i in 1 2 3 4 5 6; do
+              "$@" && return 0 || rc=$?
+              [ "$rc" -ne 255 ] && return "$rc"
+              echo "SSH connection failed (attempt $i/6); retrying in 15s"; sleep 15
+            done
+            return "$rc"
+          }
+          ssh_run() { ssh "${ssh_opts[@]}" "$dest" "bash -s" < "$1"; }
+
+          cat > "$RUNNER_TEMP/precheck.sh" <<'REMOTE'
+          set -e
+          command -v docker >/dev/null || { echo "::error::Docker is not installed on this instance."; exit 3; }
+          [ -f ~/ai-bot/.env ] || { echo "::error::~/ai-bot/.env is missing on this instance; create it (see ai-bot/.env.example) before deploying."; exit 3; }
+          echo "precheck ok: $(hostname), $(uname -m), $(docker --version)"
+          REMOTE
+          retry ssh_run "$RUNNER_TEMP/precheck.sh"
+
+          retry scp "${ssh_opts[@]}" ai-bot/docker-compose.yml "$dest:ai-bot/docker-compose.yml"
+
+          {
+            printf 'BOT_TAG=%q\nIMAGE=%q\nGHCR_USER=%q\nGHCR_TOKEN=%q\n' "$TAG" "$IMAGE" "$GHCR_USER" "$GHCR_TOKEN"
+            cat <<'REMOTE'
+          set -euo pipefail
+          cd ~/ai-bot
+          trap 'sudo docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          printf '%s' "$GHCR_TOKEN" | sudo docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null
+          sudo BOT_TAG="$BOT_TAG" docker compose pull bot
+          sudo BOT_TAG="$BOT_TAG" docker compose up -d
+          sudo docker logout ghcr.io >/dev/null
+
+          want="$IMAGE:$BOT_TAG"
+          for i in $(seq 1 24); do
+            image=$(sudo docker inspect -f '{{.Config.Image}}' ai-bot)
+            state=$(sudo docker inspect -f '{{.State.Status}} restarts={{.RestartCount}}' ai-bot)
+            # grep without -q reads all input, so pipefail doesn't see a SIGPIPE from docker logs.
+            if [ "$image" = "$want" ] && sudo docker logs ai-bot 2>&1 | grep "Application started" >/dev/null; then
+              echo "healthy: $want ($state)"
+              exit 0
+            fi
+            case "$state" in exited*|dead*) break ;; esac
+            sleep 5
+          done
+          echo "::error::Bot did not become healthy (image=$image, state=$state). Last log lines:"
+          sudo docker logs --tail 40 ai-bot 2>&1 | grep -v getUpdates || true
+          exit 4
+          REMOTE
+          } > "$RUNNER_TEMP/deploy.sh"
+          retry ssh_run "$RUNNER_TEMP/deploy.sh"
+          rm -f "$RUNNER_TEMP/deploy.sh"
+
+      - name: Summary
+        if: always()
+        env:
+          TARGET: ${{ steps.target.outputs.name }}
+          TAG: ${{ steps.target.outputs.tag }}
+          RESULT: ${{ job.status }}
+        run: |
+          {
+            echo "### Bot deploy: $RESULT"
+            echo
+            echo "| Instance | Image |"
+            echo "|---|---|"
+            echo "| $TARGET | \`$IMAGE:$TAG\` |"
+            echo
+            echo "Roll back: run this workflow manually with \`image_tag\` set to an earlier \`sha-\` tag."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

@@ -1,2 +1,15 @@
 vendor/
 .env
+.env.*
+!.env.example
+*.pem
+.oci/
+oci.log
+oci_cache.json
+too_many_requests_waiter.txt
+
+# ai-bot runtime data (big downloads, JDownloader config/state, watch db)
+ai-bot/downloads/
+ai-bot/jdownloader-config/
+ai-bot/data/
+__pycache__/

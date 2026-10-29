@@ -1,0 +1,57 @@
+services:
+  # Local Telegram Bot API server. Lets the bot send files up to 2 GB (public
+  # api.telegram.org caps bot uploads at 50 MB). Runs in --local mode so it can read
+  # finished downloads straight off disk instead of re-uploading them through the bot.
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: telegram-bot-api
+    restart: unless-stopped
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELEGRAM_LOCAL: 1
+    volumes:
+      - telegram-bot-api-data:/var/lib/telegram-bot-api
+      # Must match DOWNLOAD_DIR so the server can read files the bot references by path.
+      - ./downloads:/downloads
+    expose:
+      - "8081"
+
+  # JDownloader 2 handles the hard parts for all three hosts (Cloudflare challenge,
+  # per-host countdowns, and captchas). The bot drives it over the MyJDownloader API.
+  # Signs in to MyJDownloader from the MYJD_* values in .env. Headless (no GUI) to fit
+  # the 1 GB micro; manage it or solve captchas at https://my.jdownloader.org instead.
+  jdownloader:
+    image: jlesage/jdownloader-2:latest
+    container_name: jdownloader
+    restart: unless-stopped
+    environment:
+      MYJDOWNLOADER_EMAIL: ${MYJD_EMAIL}
+      MYJDOWNLOADER_PASSWORD: ${MYJD_PASSWORD}
+      MYJDOWNLOADER_DEVICE_NAME: ${MYJD_DEVICE}
+      JDOWNLOADER_HEADLESS: 1
+      JDOWNLOADER_MAX_MEM: 384M
+    volumes:
+      - ./jdownloader-config:/config
+      # JDownloader writes here (JD_OUTPUT_DIR); host ./downloads is shared with the bot.
+      - ./downloads:/output
+
+  bot:
+    # Servers run the CI-built image (BOT_TAG is set by the deploy workflow);
+    # `docker compose up --build` still builds locally from this folder.
+    image: ghcr.io/cloudwalk3r/ai-bot:${BOT_TAG:-latest}
+    build: .
+    container_name: ai-bot
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - telegram-bot-api
+      - jdownloader
+    volumes:
+      # Persist /watch alerts across container rebuilds.
+      - ./data:/app/data
+      # Finished downloads, shared with JDownloader + the Bot API server (DOWNLOAD_DIR).
+      - ./downloads:/downloads
+
+volumes:
+  telegram-bot-api-data:
