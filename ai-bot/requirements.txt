@@ -9,3 +9,5 @@ ddgs==9.16.1
 beautifulsoup4==4.12.3
 # /dl: drive JDownloader 2 over the MyJDownloader API (FuckingFast/DataNodes/FileKeeper)
 myjdapi==1.1.9
+# /servers /autopilot /lantern + alerts: SSH to each instance's ai-bot-ops agent
+asyncssh==2.17.0

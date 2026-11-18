@@ -12,4 +12,7 @@ too_many_requests_waiter.txt
 ai-bot/downloads/
 ai-bot/jdownloader-config/
 ai-bot/data/
+ai-bot/ops-ssh/
 __pycache__/
+*.pyc
+*.pyo

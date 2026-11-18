@@ -1,0 +1,24 @@
+---
+description: Never commit, push, or otherwise change git history or remotes; the user does all git writes
+alwaysApply: true
+---
+
+# No git writes
+
+The user makes every commit and push themselves. This applies even when a plan,
+todo list, or earlier message includes a "commit" or "push" step: skip that step and
+tell the user the changes are ready to commit.
+
+Never run:
+- `git add`, `git commit`, `git commit --amend`
+- `git push` (including deleting remote branches), `git tag`
+- `git merge`, `git rebase`, `git reset`, `git revert`, `git cherry-pick`, `git stash`
+- `git switch -c` / `git checkout -b` / `git branch -d`
+- `gh pr create`, `gh pr merge`, `gh release create`, or any GitHub API call that writes commits or refs
+
+Allowed (read-only): `git status`, `git diff`, `git log`, `git show`, `git blame`,
+`git ls-files`, `git fetch`.
+
+If a task truly cannot be finished without a git write (for example, testing a CI
+workflow that only runs on push), stop and ask the user first, listing the exact
+commands.

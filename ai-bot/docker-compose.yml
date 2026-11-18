@@ -1,7 +1,6 @@
 services:
-  # Local Telegram Bot API server. Lets the bot send files up to 2 GB (public
-  # api.telegram.org caps bot uploads at 50 MB). Runs in --local mode so it can read
-  # finished downloads straight off disk instead of re-uploading them through the bot.
+  # Local Telegram Bot API server — lets the bot send files up to 2 GB
+  # (public api.telegram.org caps bot uploads at 50 MB).
   telegram-bot-api:
     image: aiogram/telegram-bot-api:latest
     container_name: telegram-bot-api
@@ -12,15 +11,22 @@ services:
       TELEGRAM_LOCAL: 1
     volumes:
       - telegram-bot-api-data:/var/lib/telegram-bot-api
-      # Must match DOWNLOAD_DIR so the server can read files the bot references by path.
       - ./downloads:/downloads
     expose:
       - "8081"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/ || exit 0"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-  # JDownloader 2 handles the hard parts for all three hosts (Cloudflare challenge,
-  # per-host countdowns, and captchas). The bot drives it over the MyJDownloader API.
-  # Signs in to MyJDownloader from the MYJD_* values in .env. Headless (no GUI) to fit
-  # the 1 GB micro; manage it or solve captchas at https://my.jdownloader.org instead.
+  # JDownloader 2 — handles Cloudflare challenges, captchas, and host countdowns.
+  # Driven by the bot over the MyJDownloader relay API.
   jdownloader:
     image: jlesage/jdownloader-2:latest
     container_name: jdownloader
@@ -33,25 +39,45 @@ services:
       JDOWNLOADER_MAX_MEM: 384M
     volumes:
       - ./jdownloader-config:/config
-      # JDownloader writes here (JD_OUTPUT_DIR); host ./downloads is shared with the bot.
       - ./downloads:/output
+    # Optional: expose noVNC for manual JD management (captcha solving etc.)
+    # ports:
+    #   - "5800:5800"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   bot:
-    # Servers run the CI-built image (BOT_TAG is set by the deploy workflow);
-    # `docker compose up --build` still builds locally from this folder.
     image: ghcr.io/cloudwalk3r/ai-bot:${BOT_TAG:-latest}
     build: .
     container_name: ai-bot
     restart: unless-stopped
     env_file: .env
     depends_on:
-      - telegram-bot-api
-      - jdownloader
+      telegram-bot-api:
+        condition: service_started
+      jdownloader:
+        condition: service_started
     volumes:
-      # Persist /watch alerts across container rebuilds.
       - ./data:/app/data
-      # Finished downloads, shared with JDownloader + the Bot API server (DOWNLOAD_DIR).
       - ./downloads:/downloads
+      # SSH key + known_hosts for /servers, /autopilot, /lantern (see ops-agent/install.sh).
+      - ./ops-ssh:/app/ops-ssh:ro
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   telegram-bot-api-data:

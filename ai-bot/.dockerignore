@@ -4,6 +4,15 @@
 data/
 downloads/
 jdownloader-config/
+ops-ssh/
+ops-agent/
 __pycache__/
 *.pyc
+*.pyo
 selftest.py
+.git
+.gitignore
+docker-compose.yml
+docker-compose.*.yml
+README.md
+*.md

@@ -1,0 +1,485 @@
+#!/usr/bin/python3
+"""Forced command for ai-bot's ops SSH key: runs one allowlisted check or action and prints JSON.
+
+Installed as /usr/local/bin/ai-bot-ops by install.sh and bound to the key in ~/.ssh/authorized_keys:
+    command="/usr/local/bin/ai-bot-ops",restrict ssh-ed25519 AAAA... ai-bot-ops
+The key can run nothing else; the requested verb arrives in SSH_ORIGINAL_COMMAND.
+
+    health                        uptime, load, memory, disk, containers, updates, failed units
+    lantern-status                Lanternlight queue state, parked parts and their last error
+    lantern-retry                 clear Lanternlight failure counts (autorun.py retry)
+    autopilot-status [SINCE]      guardian status, paused streams, nightly build, events newer than SINCE
+    autopilot-pause STREAM        pause a stream (youtube, site, gumroad, newsletter, stock, all)
+    autopilot-resume STREAM       resume a stream
+    review-list                   YouTube items and built Lanternlight parts that can be reviewed
+    review-item ID [FRAMES]       script, facts, title, description, thumbnail and FRAMES sampled stills of a video
+    review-lantern SLUG PART      story, narration, captions and contact sheet of one Lanternlight part
+    autopilot-block ID            stop a queued item from publishing (a long video takes its Short with it)
+    autopilot-unblock ID          put a blocked item back in the queue
+    yt-stats                      views, likes and comments per published video (retention when Analytics is enabled)
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+LANTERN = HOME / "lanternlight"
+AUTOPILOT = HOME / "autopilot"
+ENGINE = "autopilot-engine-1"
+STREAMS = ("youtube", "site", "gumroad", "newsletter", "stock", "all")
+NIGHTLY_LINE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) nightly: (.*)$")
+
+
+def sh(cmd, timeout=60, cwd=None):
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+    return r.returncode, r.stdout, r.stderr
+
+
+def docker(*args, timeout=30):
+    return sh(["sudo", "-n", "docker", *args], timeout=timeout)
+
+
+def has_docker():
+    return shutil.which("docker") is not None
+
+
+def tail_lines(path, n, max_bytes=262144):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - max_bytes))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+    return lines[-n:]
+
+
+def ts(s):
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+
+
+# ---------------------------------------------------------------------------
+def health():
+    mem = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":", 1)
+            mem[k] = int(v.split()[0]) // 1024
+    disk = shutil.disk_usage("/")
+    with open("/proc/uptime") as f:
+        uptime = float(f.read().split()[0])
+
+    containers = None
+    if has_docker():
+        containers = []
+        code, out, _ = docker("ps", "-aq")
+        ids = out.split() if code == 0 else []
+        if ids:
+            fmt = "{{json .Name}}\t{{.State.Status}}\t{{.RestartCount}}\t{{.State.StartedAt}}\t{{json .Config.Image}}" \
+                  "\t{{if .State.Health}}{{.State.Health.Status}}{{end}}\t{{.State.OOMKilled}}\t{{.HostConfig.RestartPolicy.Name}}"
+            code, out, _ = docker("inspect", "-f", fmt, *ids)
+            for line in out.splitlines() if code == 0 else []:
+                name, state, restarts, started, image, hc, oom, policy = line.split("\t")
+                containers.append({
+                    "name": json.loads(name).lstrip("/"), "state": state, "restarts": int(restarts),
+                    "started": started, "image": json.loads(image), "health": hc or None, "oom": oom == "true",
+                    # Only containers with a restart policy are meant to stay up; `run --rm` jobs come and go.
+                    "managed": policy not in ("", "no"),
+                })
+
+    updates = security = None
+    if os.path.exists("/usr/lib/update-notifier/apt-check"):
+        code, _, err = sh(["/usr/lib/update-notifier/apt-check"], timeout=60)
+        m = re.match(r"(\d+);(\d+)", err.strip())
+        if m:
+            updates, security = int(m.group(1)), int(m.group(2))
+    if updates is None:
+        code, out, _ = sh(["apt", "list", "--upgradable"], timeout=60)
+        updates = sum("upgradable from" in l for l in out.splitlines())
+
+    _, out, _ = sh(["systemctl", "--failed", "--no-legend", "--plain"], timeout=15)
+    failed = [l.split()[0] for l in out.splitlines() if l.strip()]
+
+    return {
+        "host": os.uname().nodename, "arch": os.uname().machine, "uptime_s": int(uptime),
+        "load": [round(x, 2) for x in os.getloadavg()], "cpus": os.cpu_count(),
+        "mem_total_mb": mem.get("MemTotal", 0), "mem_avail_mb": mem.get("MemAvailable", 0),
+        "swap_total_mb": mem.get("SwapTotal", 0), "swap_used_mb": mem.get("SwapTotal", 0) - mem.get("SwapFree", 0),
+        "disk_total_gb": round(disk.total / 1e9, 1), "disk_free_gb": round(disk.free / 1e9, 1),
+        "disk_used_pct": round(100 * (disk.total - disk.free) / disk.total, 1),
+        "containers": containers, "updates": updates, "security_updates": security,
+        "reboot_required": os.path.exists("/var/run/reboot-required"), "failed_units": failed,
+    }
+
+
+# ---------------------------------------------------------------------------
+def build_error(lines):
+    """The line that says why a build stopped: the last output before the Python traceback, skipping render progress."""
+    lines = [l.strip() for l in lines if l.strip()]
+    tb = max((i for i, l in enumerate(lines) if l.startswith("Traceback (most recent call last)")), default=len(lines))
+    for l in reversed(lines[:tb]):
+        if not re.match(r"w\d+ \d+/\d+", l):
+            return l[:300]
+    return lines[-1][:300] if lines else ""
+
+
+def lantern_status():
+    if not (LANTERN / "autorun.py").exists():
+        return {"present": False}
+    code, out, err = sh(["python3", "autorun.py", "status"], cwd=LANTERN, timeout=60)
+    if code != 0:
+        raise RuntimeError(f"autorun.py status failed: {(err or out).strip()[-300:]}")
+    head, end = json.JSONDecoder().raw_decode(out)
+    nxt, posted_recent = [], []
+    for line in out[end:].splitlines():
+        line = line.strip()
+        if line.startswith("next:"):
+            nxt.append(re.sub(r"\s+", " ", line[5:]).strip())
+    st = json.loads((LANTERN / "status.json").read_text())
+    cut = time.time() - 86400
+    for p in st.get("posted", []):
+        if isinstance(p, dict):
+            try:
+                if ts(p.get("at", "")) > cut:
+                    posted_recent.append(p["part"])
+            except ValueError:
+                pass
+    errors = {}
+    for part in head.get("current") or []:
+        slug, _, n = part.rpartition(":")
+        if re.fullmatch(r"[a-z0-9-]+", slug) and n.isdigit():
+            errors[part] = build_error(tail_lines(LANTERN / "logs" / f"{slug}_p{n}.txt", 80))
+    last = tail_lines(LANTERN / "logs" / "autorun.log", 1)
+    return {
+        "present": True, **head, "fails": st.get("fails", {}), "next": nxt[:8], "next_total": len(nxt),
+        "posted_24h": posted_recent, "errors": errors, "last_log": last[0] if last else None,
+    }
+
+
+def lantern_retry():
+    if not (LANTERN / "autorun.py").exists():
+        raise RuntimeError("Lanternlight is not on this host")
+    code, out, err = sh(["flock", "-w", "5", "/tmp/lanternlight.lock", "python3", "autorun.py", "retry"],
+                        cwd=LANTERN, timeout=60)
+    if code != 0:
+        return {"ok": False, "message": "a build is running right now; try again after it finishes"}
+    return {"ok": True, "message": out.strip()}
+
+
+# ---------------------------------------------------------------------------
+AP_STATUS = """
+import json, sys
+from autopilot import db
+from autopilot.guardian import health
+db.init()
+since = float(sys.argv[1])
+events = [e for e in db.recent_events(200) if e["ts"] > since]
+print(json.dumps({"status": health.status_text(), "paused": db.paused(), "events": events}, default=str))
+"""
+
+AP_SET = """
+import sys
+from autopilot import db
+db.init()
+action, stream = sys.argv[1], sys.argv[2]
+if action == "pause":
+    db.pause(stream, "paused by owner (ai-bot)")
+else:
+    db.resume(stream)
+db.log_event("info", stream, f"{action}d by owner (ai-bot)")
+"""
+
+
+def nightly():
+    lines = [m.groups() for m in map(NIGHTLY_LINE.match, tail_lines(AUTOPILOT / "nightly.log", 4000)) if m]
+    starts = [i for i, (_, msg) in enumerate(lines) if msg.startswith("topic ")]
+    info = {"running": sh(["pgrep", "-f", "whiteboard/nightly.sh"], timeout=10)[0] == 0}
+    if starts:
+        i = starts[-1]
+        after = [msg for _, msg in lines[i + 1:]]
+        info.update(topic=lines[i][1][6:], started=lines[i][0],
+                    queued=any(m.startswith("queued ") for m in after),
+                    last=lines[-1][1], last_at=lines[-1][0])
+    elif lines:
+        info.update(last=lines[-1][1], last_at=lines[-1][0])
+    progress = tail_lines(AUTOPILOT / "nightly.log", 1)
+    info["progress"] = progress[0][:120] if progress and info["running"] else None
+    return info
+
+
+def autopilot_status(since="0"):
+    if not (AUTOPILOT / "docker-compose.yml").exists():
+        return {"present": False}
+    code, out, err = docker("exec", ENGINE, "python", "-c", AP_STATUS, str(float(since)), timeout=60)
+    if code != 0:
+        raise RuntimeError(f"autopilot engine not answering: {(err or out).strip()[-300:]}")
+    data = json.loads(out.strip().splitlines()[-1])
+    code, out, _ = docker("ps", "--no-trunc", "--filter", "name=autopilot-studio-run", "--format", "{{.Names}}\t{{.Command}}\t{{.RunningFor}}")
+    data["studio_jobs"] = [dict(zip(("name", "cmd", "running_for"), l.split("\t"))) for l in out.splitlines() if l.strip()]
+    data["nightly"] = nightly()
+    data["present"] = True
+    return data
+
+
+def autopilot_set(action, stream):
+    code, out, err = docker("exec", ENGINE, "python", "-c", AP_SET, action, stream, timeout=60)
+    if code != 0:
+        raise RuntimeError(f"could not {action} {stream}: {(err or out).strip()[-300:]}")
+    return {"ok": True, "message": f"{stream} {action}d"}
+
+
+# ---------------------------------------------------------------------------
+# Review material: what a reviewer needs to judge a video, read-only.
+def engine(script, *args, timeout=120):
+    """Run a script inside the Autopilot engine container and return the JSON it prints."""
+    code, out, err = docker("exec", ENGINE, "python", "-c", script, *args, timeout=timeout)
+    if code != 0:
+        raise RuntimeError(f"autopilot engine: {(err or out).strip()[-300:]}")
+    data = json.loads(out.strip().splitlines()[-1])
+    if isinstance(data, dict) and data.get("error"):
+        raise RuntimeError(data["error"])
+    return data
+
+
+AP_ITEMS = """
+import json
+from autopilot import db
+db.init()
+out = []
+for it in db.items(stream="youtube", limit=2000):
+    p = it["payload"]
+    out.append({"id": it["id"], "kind": it["kind"], "title": it["title"], "status": it["status"],
+                "publish_at": it["publish_at"], "episode": p.get("whiteboard"), "parent": p.get("parent"),
+                "url": it.get("external_url")})
+print(json.dumps(out))
+"""
+
+AP_ITEM = """
+import base64, json, os, subprocess, sys
+from autopilot import db
+db.init()
+it = db.get_item(sys.argv[1])
+if not it or it["stream"] != "youtube":
+    print(json.dumps({"error": "no YouTube item with that id"})); sys.exit(0)
+p, kind = it["payload"], it["kind"]
+video = p.get("video") or ""
+out = {"id": it["id"], "kind": kind, "title": it["title"], "status": it["status"], "publish_at": it["publish_at"],
+       "url": it.get("external_url"), "episode": p.get("whiteboard"), "meta": {}, "frames": []}
+try:
+    up = json.load(open(os.path.join(os.path.dirname(video), "upload.json"), encoding="utf-8"))
+    out["meta"] = {k: (up.get(kind) or {}).get(k) for k in ("title", "description", "tags", "hashtags")}
+except (OSError, ValueError):
+    pass
+thumb = p.get("thumbnail")
+if thumb and os.path.exists(thumb) and os.path.getsize(thumb) < 2_000_000:
+    out["thumbnail"] = base64.b64encode(open(thumb, "rb").read()).decode()
+n = int(sys.argv[2])
+if os.path.exists(video):
+    dur = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", video],
+                               capture_output=True, text=True, timeout=30).stdout.strip() or 0)
+    out["duration"] = round(dur, 1)
+    for i in range(n if dur else 0):
+        t = dur * (i + 0.5) / n
+        r = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{t:.2f}", "-i", video, "-frames:v", "1", "-vf",
+                            "scale='if(gt(iw,ih),640,360)':-2", "-q:v", "6", "-f", "image2pipe", "-vcodec", "mjpeg", "-"],
+                           capture_output=True, timeout=90)
+        if r.returncode == 0 and r.stdout:
+            out["frames"].append({"t": round(t, 1), "jpg": base64.b64encode(r.stdout).decode()})
+print(json.dumps(out))
+"""
+
+AP_BLOCK = """
+import json, sys
+from autopilot import db
+db.init()
+action, it = sys.argv[1], db.get_item(sys.argv[2])
+if not it:
+    print(json.dumps({"error": "no item with that id"})); sys.exit(0)
+# A Short points viewers at its long video, so the pair moves together when the long one is blocked.
+group = [it] + [s for s in db.items(stream=it["stream"], limit=2000)
+                if it["kind"] == "long" and s["payload"].get("parent") == it["id"]]
+changed = []
+for x in group:
+    key = f"aibot_before_block:{x['id']}"
+    if action == "block" and x["status"] in ("queued", "held"):
+        db.kv_set(key, x["status"])
+        now = "blocked"
+    elif action == "unblock" and x["status"] == "blocked":
+        now = db.kv_get(key) or "queued"  # back to where it was: queued, or held until it gets a slot
+    else:
+        continue
+    db.update_item(x["id"], status=now)
+    db.log_event("info", x["stream"], f"{now} by owner (ai-bot): {x['title']}")
+    changed.append({"id": x["id"], "kind": x["kind"], "title": x["title"], "status": now})
+print(json.dumps({"ok": bool(changed), "status": changed[0]["status"] if changed else it["status"], "changed": changed}))
+"""
+
+AP_STATS = """
+import datetime, json
+from autopilot import db
+from autopilot.google_auth import service
+db.init()
+items = [i for i in db.items(stream="youtube", status="published", limit=2000)
+         if i.get("external_id") and not i["payload"].get("dry_run")]
+by_id = {i["external_id"]: i for i in items}
+ids = list(by_id)
+videos = {}
+yt = service("youtube", "v3")
+for n in range(0, len(ids), 50):
+    res = yt.videos().list(part="statistics,snippet,contentDetails", id=",".join(ids[n:n + 50])).execute()
+    for v in res.get("items", []):
+        it, st = by_id[v["id"]], v["statistics"]
+        videos[v["id"]] = {"vid": v["id"], "item": it["id"], "kind": it["kind"], "title": v["snippet"]["title"], "url": it.get("external_url"),
+                           "episode": it["payload"].get("whiteboard"), "published": v["snippet"]["publishedAt"],
+                           "duration": v["contentDetails"].get("duration"), "views": int(st.get("viewCount", 0)),
+                           "likes": int(st.get("likeCount", 0)), "comments": int(st.get("commentCount", 0))}
+out = {"videos": list(videos.values()), "analytics": None, "analytics_error": None}
+try:
+    ya = service("youtubeAnalytics", "v2")
+    end = datetime.date.today(); start = end - datetime.timedelta(days=28)
+    cols = "views,estimatedMinutesWatched,averageViewDuration,averageViewPercentage,subscribersGained"
+    for n in range(0, len(ids), 50):
+        r = ya.reports().query(ids="channel==MINE", startDate=str(start), endDate=str(end), dimensions="video",
+                               metrics=cols, filters="video==" + ",".join(ids[n:n + 50]), maxResults=200).execute()
+        names = [h["name"] for h in r.get("columnHeaders", [])]
+        for row in r.get("rows", []):
+            rec = dict(zip(names, row))
+            if rec.get("video") in videos:
+                videos[rec["video"]]["last28"] = {k: rec[k] for k in names if k != "video"}
+    r = ya.reports().query(ids="channel==MINE", startDate=str(start), endDate=str(end),
+                           metrics="views,estimatedMinutesWatched,subscribersGained,subscribersLost").execute()
+    out["analytics"] = dict(zip([h["name"] for h in r["columnHeaders"]], (r.get("rows") or [[0, 0, 0, 0]])[0]))
+except Exception as e:
+    import re
+    link = re.search(r"https://console\\.developers\\.google\\.com/[\\w./?=&-]+", str(e))
+    out["analytics_error"] = "disabled" if link else str(e)[:200]
+    out["analytics_enable_url"] = link.group(0) if link else None
+print(json.dumps(out))
+"""
+
+SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,80}")
+ITEM_ID = re.compile(r"[0-9a-f]{8,32}")
+
+
+def read_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def lantern_parts():
+    """Built Lanternlight parts in queue order."""
+    if not (LANTERN / "queue.json").exists():
+        return []
+    parts = []
+    for slug in read_json(LANTERN / "queue.json").get("stories", []):
+        try:
+            story = read_json(LANTERN / "stories" / slug / "story.json")
+        except (OSError, ValueError):
+            continue
+        out = LANTERN / "series" / "out" / slug
+        for p in story.get("parts", []):
+            n = p.get("n")
+            meta = out / f"p{n}.json"
+            if not (meta.exists() and (out / f"p{n}.mp4").exists()):
+                continue
+            parts.append({"slug": slug, "part": n, "of": len(story["parts"]), "title": story.get("title"),
+                          "name": p.get("name"), "built": int(meta.stat().st_mtime),
+                          "posted": (out / f"p{n}_posted.json").exists()})
+    return parts
+
+
+def review_list():
+    youtube = engine(AP_ITEMS) if (AUTOPILOT / "docker-compose.yml").exists() else []
+    return {"youtube": youtube, "lantern": lantern_parts()}
+
+
+def review_item(item_id, frames="0"):
+    data = engine(AP_ITEM, item_id, str(min(int(frames), 8)), timeout=300)
+    episode = data.get("episode") or ""
+    if SLUG.fullmatch(episode):
+        try:
+            data["beats"] = read_json(AUTOPILOT / "studio" / "episodes" / f"{episode}.lines.json").get(data["kind"], [])
+        except (OSError, ValueError):
+            data["beats"] = []
+        try:
+            brief = read_json(AUTOPILOT / "studio" / "episodes" / f"{episode}.json")
+            data["brief"] = {k: brief.get(k) for k in ("promise", "audience", "assumptions", "facts")}
+        except (OSError, ValueError):
+            data["brief"] = {}
+    return data
+
+
+def review_lantern(slug, part):
+    n = int(part)
+    story = read_json(LANTERN / "stories" / slug / "story.json")
+    p = next((x for x in story.get("parts", []) if x.get("n") == n), None)
+    out = LANTERN / "series" / "out" / slug
+    if p is None or not (out / f"p{n}.json").exists():
+        raise RuntimeError(f"{slug} part {n} is not built")
+    built = read_json(out / f"p{n}.json")
+    data = {
+        "slug": slug, "part": n, "of": len(story["parts"]), "title": story.get("title"), "premise": story.get("premise"),
+        "pov": story.get("pov"), "bible": story.get("bible"),
+        "earlier": [{"n": x.get("n"), "name": x.get("name"), "payoff": x.get("payoff"), "cliffhanger": x.get("cliffhanger")}
+                    for x in story["parts"] if x.get("n", 0) < n],
+        "later": [{"n": x.get("n"), "name": x.get("name")} for x in story["parts"] if x.get("n", 0) > n],
+        "this": {k: p.get(k) for k in ("name", "hook_text", "payoff", "cliffhanger", "headline", "comment_prompt",
+                                       "caption_question", "search_line", "tags_ig", "tags_fb")},
+        "lines": [l.get("text", "") for l in p.get("lines", [])],
+        "built": {k: built.get(k) for k in ("duration", "words", "lufs", "caption_fb", "caption_ig")},
+        "posted": (out / f"p{n}_posted.json").exists(),
+    }
+    sheet = out / f"p{n}_sheet.jpg"
+    if sheet.exists() and sheet.stat().st_size < 2_000_000:
+        import base64
+        data["sheet"] = base64.b64encode(sheet.read_bytes()).decode()
+    return data
+
+
+def autopilot_block(action, item_id):
+    return engine(AP_BLOCK, action, item_id)
+
+
+# ---------------------------------------------------------------------------
+def main():
+    words = os.environ.get("SSH_ORIGINAL_COMMAND", "").split()
+    verb, args = (words[0], words[1:]) if words else ("", [])
+    try:
+        if verb == "health" and not args:
+            result = health()
+        elif verb == "lantern-status" and not args:
+            result = lantern_status()
+        elif verb == "lantern-retry" and not args:
+            result = lantern_retry()
+        elif verb == "autopilot-status" and len(args) <= 1 and all(re.fullmatch(r"\d+(\.\d+)?", a) for a in args):
+            result = autopilot_status(*args)
+        elif verb in ("autopilot-pause", "autopilot-resume") and len(args) == 1 and args[0] in STREAMS:
+            result = autopilot_set(verb.split("-")[1], args[0])
+        elif verb == "review-list" and not args:
+            result = review_list()
+        elif verb == "review-item" and len(args) in (1, 2) and ITEM_ID.fullmatch(args[0]) and all(a in "012345678" for a in args[1:]):
+            result = review_item(*args)
+        elif verb == "review-lantern" and len(args) == 2 and SLUG.fullmatch(args[0]) and re.fullmatch(r"\d{1,2}", args[1]):
+            result = review_lantern(*args)
+        elif verb in ("autopilot-block", "autopilot-unblock") and len(args) == 1 and ITEM_ID.fullmatch(args[0]):
+            result = autopilot_block(verb.split("-")[1], args[0])
+        elif verb == "yt-stats" and not args:
+            result = engine(AP_STATS, timeout=120)
+        else:
+            print(json.dumps({"error": f"not allowed: {' '.join(words)[:80] or '(empty)'}"}))
+            return 2
+    except Exception as e:  # noqa: BLE001 - every failure goes back to the bot as JSON
+        print(json.dumps({"error": str(e)[:500]}))
+        return 1
+    print(json.dumps(result, default=str))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -2,7 +2,7 @@ import os
 from openai import OpenAI
 
 PROVIDERS = {
-    "ollama": (os.getenv("OLLAMA_BASE_URL", "http://10.0.1.21:11434/v1"), "ollama", "llama3.2:3b"),
+    "ollama": (os.getenv("OLLAMA_BASE_URL", "http://10.0.1.55:11434/v1"), "ollama", "llama3.2:3b"),
     "groq": ("https://api.groq.com/openai/v1", os.getenv("GROQ_API_KEY", ""), "openai/gpt-oss-120b"),
     "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai/", os.getenv("GEMINI_API_KEY", ""), "gemini-flash-latest"),
     "github": ("https://models.github.ai/inference", os.getenv("GITHUB_MODELS_TOKEN", ""), "openai/gpt-4o-mini"),

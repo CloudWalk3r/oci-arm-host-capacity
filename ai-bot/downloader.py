@@ -1,14 +1,19 @@
 """
-Large-file downloader: drive JDownloader 2 over the MyJDownloader API, then hand the
-finished files to the Telegram uploader in bot.py.
+Large-file downloader — drives JDownloader 2 over the MyJDownloader relay API
+and hands finished files to the Telegram uploader in bot.py.
 
-JDownloader handles the parts that plain HTTP can't:
-  - FuckingFast (fuckingfast.co): whole site behind a Cloudflare JS challenge.
-  - DataNodes (datanodes.to): XFileSharing, 10s wait + Cloudflare Turnstile captcha.
-  - FileKeeper (filekeeper.net): XFileSharing, 5s wait, no captcha (trivial).
+JDownloader handles the tricky parts that plain HTTP automation cannot:
+  • FuckingFast  (fuckingfast.co)  — full Cloudflare JS challenge
+  • DataNodes    (datanodes.to)    — XFileSharing + Cloudflare Turnstile captcha
+  • FileKeeper   (filekeeper.net)  — XFileSharing + 5-second countdown
 
-The bot only needs: detect_host/extract_urls to validate input, and a JDClient to add a
-job, poll its progress, list finished files, and cancel.
+Public surface used by bot.py:
+  detect_host(url)      → friendly host name or None
+  extract_urls(text)    → list of http(s) URLs in arbitrary text
+  SUPPORTED_HOSTS       → {domain: label}
+  MYJD_AVAILABLE        → bool (is myjdapi installed?)
+  JDClient              → add_job / poll / finished_files / cancel / add_crawl / crawl_links
+  Job, Snapshot         → dataclasses for job state
 """
 from __future__ import annotations
 
@@ -126,25 +131,37 @@ class JDClient:
         self._device = None
 
     # -- connection -------------------------------------------------------
-    def connect(self):
+    def connect(self, _retries: int = 3):
         if not MYJD_AVAILABLE:
             raise RuntimeError("myjdapi is not installed")
-        jd = myjdapi.Myjdapi()
-        jd.set_app_key(self.app_key)
-        jd.connect(self.email, self.password)
-        jd.update_devices()
-        try:
-            device = jd.get_device(self.device_name)
-        except Exception:
-            device = None
-        if device is None:
-            names = [d.get("name") for d in jd.list_devices()]
-            raise RuntimeError(
-                f"MyJDownloader device {self.device_name!r} not found. Available: {names or 'none'}"
-            )
-        self._jd = jd
-        self._device = device
-        return device
+        last_err = None
+        for attempt in range(1, _retries + 1):
+            try:
+                jd = myjdapi.Myjdapi()
+                jd.set_app_key(self.app_key)
+                jd.connect(self.email, self.password)
+                jd.update_devices()
+                try:
+                    device = jd.get_device(self.device_name)
+                except Exception:
+                    device = None
+                if device is None:
+                    names = [d.get("name") for d in jd.list_devices()]
+                    raise RuntimeError(
+                        f"MyJDownloader device {self.device_name!r} not found. Available: {names or 'none'}"
+                    )
+                self._jd = jd
+                self._device = device
+                self._cleanup_stale()
+                return device
+            except RuntimeError:
+                raise  # device-not-found is not transient
+            except Exception as e:
+                last_err = e
+                log.warning("connect attempt %d/%d failed: %s", attempt, _retries, e)
+                if attempt < _retries:
+                    time.sleep(3 * attempt)
+        raise last_err  # type: ignore[misc]
 
     @property
     def device(self):
@@ -154,6 +171,7 @@ class JDClient:
 
     def _reconnect(self):
         self._jd = self._device = None
+        time.sleep(2)
         return self.connect()
 
     def _call(self, fn):
@@ -161,9 +179,34 @@ class JDClient:
         try:
             return fn(self.device)
         except Exception as e:  # myjdapi raises on expired tokens / transient relay errors
-            log.warning("MyJDownloader call failed (%s); reconnecting", e)
+            log.warning("MyJDownloader call failed (%s); reconnecting…", e)
             self._reconnect()
             return fn(self.device)
+
+    def _cleanup_stale(self) -> None:
+        """Remove leftover tgdl-*/tgcrawl-* packages from previous bot runs."""
+        for query_fn in (
+            lambda d: d.linkgrabber.query_packages([{}]),
+            lambda d: d.downloads.query_packages([{}]),
+        ):
+            try:
+                pkgs = self._call(query_fn) or []
+                stale = [
+                    p["uuid"] for p in pkgs
+                    if (p.get("name") or "").startswith(("tgdl-", "tgcrawl-")) and "uuid" in p
+                ]
+                if stale:
+                    try:
+                        self._call(lambda d: d.linkgrabber.remove_links([], stale))
+                    except Exception:
+                        pass
+                    try:
+                        self._call(lambda d: d.downloads.remove_links([], stale))
+                    except Exception:
+                        pass
+                    log.info("Cleaned up %d stale bot package(s) from JDownloader", len(stale))
+            except Exception:
+                pass
 
     # -- jobs -------------------------------------------------------------
     def add_job(self, urls: list[str]) -> Job:
@@ -222,14 +265,21 @@ class JDClient:
         return snap
 
     def finished_files(self, job: Job) -> list[Path]:
-        """Completed files for a job, read off the shared volume."""
-        if not job.read_dir.exists():
-            return []
-        files = [
-            p for p in sorted(job.read_dir.rglob("*"))
-            if p.is_file() and not p.name.lower().endswith(_PARTIAL_SUFFIXES)
-        ]
-        return files
+        """Completed files for a job, read off the shared volume.
+
+        Retries a couple of times to tolerate Docker cross-container volume sync lag.
+        """
+        for attempt in range(4):
+            if job.read_dir.exists():
+                files = [
+                    p for p in sorted(job.read_dir.rglob("*"))
+                    if p.is_file() and not p.name.lower().endswith(_PARTIAL_SUFFIXES)
+                ]
+                if files:
+                    return files
+            if attempt < 3:
+                time.sleep(2)
+        return []
 
     def cancel(self, job: Job) -> None:
         job.cancelled = True
