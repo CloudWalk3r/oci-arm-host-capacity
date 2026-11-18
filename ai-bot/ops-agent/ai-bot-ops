@@ -17,6 +17,10 @@ The key can run nothing else; the requested verb arrives in SSH_ORIGINAL_COMMAND
     autopilot-block ID            stop a queued item from publishing (a long video takes its Short with it)
     autopilot-unblock ID          put a blocked item back in the queue
     yt-stats                      views, likes and comments per published video (retention when Analytics is enabled)
+    assign-list [all]             upcoming assignments and deadlines from the snapshot the PC pushed
+    assign-brief ID               the brief of one assignment
+    assign-prompt ID CHARS [NOTES]  the task for a model to write it, under CHARS characters (NOTES: base64url)
+    assign-build ID               build the .docx from the written text on stdin; returns it as base64
 """
 import json
 import os
@@ -447,6 +451,27 @@ def autopilot_block(action, item_id):
 
 
 # ---------------------------------------------------------------------------
+# Assignments: the project's own code does the work (assign_driver.py), run with the project's Python.
+ASSIGNMENTS = HOME / "Assignments"
+ASSIGN_DRIVER = Path("/usr/local/lib/ai-bot-ops/assign_driver.py")
+ASSIGN_ID = re.compile(r"\d{1,9}")
+BASE64URL = re.compile(r"[A-Za-z0-9_-]{1,8000}")
+
+
+def assignments(*args, stdin=False):
+    python = ASSIGNMENTS / ".venv" / "bin" / "python"
+    if not (python.exists() and ASSIGN_DRIVER.exists()):
+        raise RuntimeError("the Assignments project is not installed on this host")
+    # stdin=None hands this process's stdin (the SSH channel) to the driver, which is how the text arrives.
+    r = subprocess.run([str(python), str(ASSIGN_DRIVER), *args], stdin=None if stdin else subprocess.DEVNULL,
+                       capture_output=True, text=True, timeout=240, cwd=ASSIGNMENTS)
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        raise RuntimeError(f"assignments: {(r.stderr or r.stdout).strip()[-300:]}") from None
+
+
+# ---------------------------------------------------------------------------
 def main():
     words = os.environ.get("SSH_ORIGINAL_COMMAND", "").split()
     verb, args = (words[0], words[1:]) if words else ("", [])
@@ -471,6 +496,15 @@ def main():
             result = autopilot_block(verb.split("-")[1], args[0])
         elif verb == "yt-stats" and not args:
             result = engine(AP_STATS, timeout=120)
+        elif verb == "assign-list" and args in ([], ["all"]):
+            result = assignments("list", *args)
+        elif verb == "assign-brief" and len(args) == 1 and ASSIGN_ID.fullmatch(args[0]):
+            result = assignments("brief", args[0])
+        elif (verb == "assign-prompt" and len(args) in (2, 3) and ASSIGN_ID.fullmatch(args[0])
+              and re.fullmatch(r"\d{4,5}", args[1]) and all(BASE64URL.fullmatch(a) for a in args[2:])):
+            result = assignments("prompt", *args)
+        elif verb == "assign-build" and len(args) == 1 and ASSIGN_ID.fullmatch(args[0]):
+            result = assignments("build", args[0], stdin=True)
         else:
             print(json.dumps({"error": f"not allowed: {' '.join(words)[:80] or '(empty)'}"}))
             return 2

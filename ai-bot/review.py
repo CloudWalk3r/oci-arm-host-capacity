@@ -31,9 +31,9 @@ def _models(spec: str) -> list[tuple[str, str]]:
 
 STATE_FILE = os.getenv("REVIEW_STATE_FILE", "data/reviews.json").strip()
 ENABLED = os.getenv("REVIEW_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
-CHECK_MINUTES = float(os.getenv("REVIEW_CHECK_MINUTES", "10") or 10)
-# How many of the next unposted Lanternlight parts are reviewed ahead of posting.
-LANTERN_AHEAD = int(os.getenv("REVIEW_LANTERN_AHEAD", "3") or 0)
+WEEKLY_CHECK_MINUTES = 30  # how often bot.py looks whether the weekly channel numbers are due
+# How many of the next unposted Lanternlight parts /review lists.
+LANTERN_AHEAD = int(os.getenv("REVIEW_LANTERN_AHEAD", "6") or 0)
 # Times in messages are shown in this offset from UTC (330 = Sri Lanka).
 UTC_OFFSET = timedelta(minutes=int(os.getenv("REVIEW_UTC_OFFSET_MINUTES", "330") or 0))
 # provider:model, tried in order. The first that answers wins.
@@ -48,11 +48,10 @@ ENDPOINTS = {
     "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai/", "GEMINI_API_KEY"),
 }
 LONG_FRAMES, SHORT_FRAMES = 8, 5  # stills sampled evenly through the video (the agent allows up to 8)
-AUTO_RETRY_S = 1800  # wait this long after a failed automatic review before trying again
 MODEL_REST_S = 900  # how long a model that failed is tried last
 KEEP_REVIEWS = 300
 
-LOCK = asyncio.Lock()  # one review at a time, so the automatic job and /review don't fight over rate limits
+LOCK = asyncio.Lock()  # one review at a time, so two requests don't fight over rate limits
 _clients: dict[str, AsyncOpenAI] = {}
 _resting: dict[str, float] = {}  # model -> time until which it is tried last
 
@@ -401,11 +400,8 @@ async def _review_video(item: dict, long_title: str | None) -> dict:
     }
 
 
-async def review_youtube(item_id: str, sent: bool = True) -> dict:
-    """Review the long video `item_id` belongs to together with its Short. Stores and returns the record.
-
-    `sent` is False for automatic reviews, which bot.py still has to deliver.
-    """
+async def review_youtube(item_id: str) -> dict:
+    """Review the long video `item_id` belongs to together with its Short. Stores and returns the record."""
     async with LOCK:
         listing = await ops.call(ops.AUTOPILOT_HOST, "review-list")
         group = next((g for g in _groups(listing["youtube"]) if any(i["id"] == item_id for i in g)), None)
@@ -418,7 +414,7 @@ async def review_youtube(item_id: str, sent: bool = True) -> dict:
         return _store({
             "key": f"yt:{lead['id']}", "kind": "youtube", "id": lead["id"], "title": lead["title"], "at": time.time(),
             "status": lead["status"], "publish_at": lead.get("publish_at"), "url": lead.get("url"),
-            "sections": sections, "sent": sent,
+            "sections": sections,
         })
 
 
@@ -429,7 +425,7 @@ def lantern_key(slug: str, part: int) -> str:
     return f"ll:{slug}:{part}"
 
 
-async def review_lantern(slug: str, part: int, built: float | None = None, sent: bool = True) -> dict:
+async def review_lantern(slug: str, part: int, built: float | None = None) -> dict:
     async with LOCK:
         d = await ops.call(ops.LANTERN_HOST, "review-lantern", slug, str(part), timeout=120)
         sheet = d.pop("sheet", None)
@@ -459,15 +455,17 @@ async def review_lantern(slug: str, part: int, built: float | None = None, sent:
                 "summary": str(answer.get("summary") or "").strip()[:300],
                 "findings": _findings(answer, "story") + seen, "stills": stills, "frames": 1 if sheet else 0,
             }],
-            "sent": sent,
         })
 
 
 # ---------------------------------------------------------------------------
-# What is waiting, and the automatic review
+# What is waiting. Nothing is reviewed until the owner picks it.
 # ---------------------------------------------------------------------------
 async def targets() -> dict:
-    """Videos that have not gone out yet: queued YouTube groups, and the next Lanternlight parts to be posted."""
+    """Videos that have not gone out yet: queued YouTube groups, and the next Lanternlight parts to be posted.
+
+    `lantern_more` counts the built parts further down the queue that are not listed.
+    """
     listing = await ops.call(ops.AUTOPILOT_HOST, "review-list")
     reviews = load()["reviews"]
     youtube = []
@@ -477,35 +475,11 @@ async def targets() -> dict:
             youtube.append({**lead, "shorts": len(group) - 1, "review": reviews.get(f"yt:{lead['id']}")})
     youtube.sort(key=lambda i: i.get("publish_at") or 0)
     lantern = []
-    for p in [p for p in listing["lantern"] if not p["posted"]][:LANTERN_AHEAD]:
+    unposted = [p for p in listing["lantern"] if not p["posted"]]
+    for p in unposted[:LANTERN_AHEAD]:
         rec = reviews.get(lantern_key(p["slug"], p["part"]))
         lantern.append({**p, "review": rec if rec and rec.get("built") == p["built"] else None})
-    return {"youtube": youtube, "lantern": lantern}
-
-
-async def next_auto() -> dict | None:
-    """Review one thing that is waiting and has no review yet. Returns its record, or None when all are done."""
-    state = load()
-    if time.time() < state.get("auto_retry_at", 0):
-        return None
-    waiting = await targets()
-    try:
-        for item in waiting["youtube"]:
-            if item["status"] != "blocked" and item["review"] is None:
-                return await review_youtube(item["id"], sent=False)
-        for p in waiting["lantern"]:
-            if p["review"] is None:
-                return await review_lantern(p["slug"], p["part"], p["built"], sent=False)
-    except (ReviewError, ops.OpsError) as e:
-        log.warning("automatic review failed, next try in %d min: %s", AUTO_RETRY_S // 60, e)
-        state = load()
-        state["auto_retry_at"] = time.time() + AUTO_RETRY_S
-        save(state)
-    return None
-
-
-def unsent() -> list[dict]:
-    return [r for r in load()["reviews"].values() if r.get("sent") is False]
+    return {"youtube": youtube, "lantern": lantern, "lantern_more": len(unposted) - len(lantern)}
 
 
 # ---------------------------------------------------------------------------

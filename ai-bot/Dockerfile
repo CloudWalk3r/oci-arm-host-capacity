@@ -17,6 +17,7 @@ COPY downloader.py .
 COPY tgformat.py .
 COPY ops.py .
 COPY review.py .
+COPY assign.py .
 
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
     CMD python -c "import sys; sys.exit(0)"

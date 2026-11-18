@@ -9,6 +9,8 @@ case "$KEY" in
   *) echo "usage: sh install.sh 'ssh-ed25519 AAAA... ai-bot-ops'" >&2; exit 1 ;;
 esac
 sudo install -m 755 -o root -g root "$(dirname "$0")/ai-bot-ops" /usr/local/bin/ai-bot-ops
+# Used by the assign-* verbs, on the host that has the Assignments project (harmless elsewhere).
+sudo install -D -m 644 -o root -g root "$(dirname "$0")/assign_driver.py" /usr/local/lib/ai-bot-ops/assign_driver.py
 mkdir -p ~/.ssh
 chmod 700 ~/.ssh
 touch ~/.ssh/authorized_keys

@@ -34,6 +34,7 @@ from telegram import (
     BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputFile,
     LinkPreviewOptions,
     Update,
 )
@@ -57,6 +58,7 @@ from downloader import (
     extract_urls,
 )
 from tgformat import Chunk, escape_md, render, split_markdown, styled, telegram_markdown
+import assign
 import ops
 import review
 
@@ -542,6 +544,8 @@ async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         "- /dl — download files to Telegram (FuckingFast / DataNodes / FileKeeper)\n"
         if DL_AVAILABLE else ""
     )
+    if assign.AVAILABLE:
+        dl_line += "- /assignments — coursework that is due, and writing it\n"
     await reply_formatted(
         update,
         "## 👋 Hi! I'm your AI assistant\n\n"
@@ -607,9 +611,14 @@ async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         "- /lantern — Lanternlight queue, retry parked parts\n"
         "- /ollama — local model server\n"
         "\n### 🎬 Reviews\n"
-        "- /review — videos and reels waiting to go out, with feedback on each\n"
+        "- /review — videos and reels not posted yet; pick one to have it reviewed\n"
         "- /audit — problems the video template repeats across every video\n"
-        "- /ytstats — views per video and what changed since the weekly report",
+        "- /ytstats — views per video and what changed since the weekly report\n"
+        "\n### 🎓 Assignments\n"
+        "- /assignments — what is due, or /assignments all for overdue ones too\n"
+        "- /brief <id> — the instructions of one assignment\n"
+        "- /write <id> [notes] — write it and send the Word document\n\n"
+        "A daily update arrives after the PC syncs with the LMS. Nothing is ever submitted.",
     )
 
 
@@ -959,7 +968,9 @@ async def cmd_tools(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         f"- **Server ops** (/servers /autopilot /lantern /ollama) — {on(ops.OPS_AVAILABLE)}"
         + (f", alerts every {ops.ALERT_MINUTES:g}m" if ops.OPS_AVAILABLE else ""),
         f"- **Video reviews** (/review /audit /ytstats) — {on(review.AVAILABLE)}"
-        + (", new videos reviewed automatically" if review.AVAILABLE else ""),
+        + (", only when you pick a video" if review.AVAILABLE else ""),
+        f"- **Assignments** (/assignments /brief /write) — {on(assign.AVAILABLE)}"
+        + (f", daily update from {assign.DIGEST_TIME}" if assign.AVAILABLE and assign.DIGEST_TIME else ""),
     ]
     await reply_formatted(update, "\n".join(lines))
 
@@ -1248,8 +1259,13 @@ async def _review_menu():
         lines.append(f"🏮 {p['title']}, part {p['part']} of {p['of']}\n    built, waiting to be posted; {result}")
         if len(f"rv:l:{p['slug']}:{p['part']}") <= 64:
             rows.append([_rv_button(f"🏮 {p['title'][:32]}, part {p['part']}", f"l:{p['slug']}:{p['part']}")])
-    text = "Waiting to go out\n\n" + ("\n".join(lines) if lines else "Nothing is waiting: no video is queued and no reel is built ahead.")
-    text += "\n\nTap one to see its review. /review <video id> reviews any video, published ones too."
+    if waiting["lantern_more"]:
+        lines.append(f"🏮 …and {waiting['lantern_more']} more reels built further down the queue")
+    text = "Not posted yet\n\n" + ("\n".join(lines) if lines else "Nothing is waiting: no video is queued and no reel is built ahead.")
+    text += (
+        "\n\nNothing is reviewed until you tap one: a video takes about two minutes, a reel about one."
+        "\n/review <video id> reviews any video, published ones too; /review <story-slug> <part> any reel."
+    )
     rows.append([_rv_button("📊 Template audit", "audit"), _rv_button("📈 Channel numbers", "stats")])
     return text, InlineKeyboardMarkup(rows)
 
@@ -1373,23 +1389,175 @@ async def on_review(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         _start_review(ctx, chat_id, _review_stats(), "Reading the channel numbers…")
 
 
-async def review_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Review whatever is newly waiting to go out (one per run) and send the weekly channel numbers when due."""
+async def weekly_stats_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the weekly channel numbers when they are due. Reviews are never sent unasked: /review shows them."""
     if not OPS_ALERT_CHAT_ID or review.LOCK.locked():
         return
     try:
-        await review.next_auto()
-        for rec in review.unsent():
-            text = "New and waiting to go out; reviewed automatically.\n\n" + review.format_review(rec)
-            await _send_long(ctx.bot, OPS_ALERT_CHAT_ID, text, _review_markup(rec))
-            review.update_stored(rec["key"], sent=True)
         if review.weekly_due():
             text, snapshot = await review.stats_report(weekly=True)
             await _send_long(ctx.bot, OPS_ALERT_CHAT_ID, text)
             review.record_weekly(snapshot)
     except Exception as e:
-        # Unsent reviews stay marked unsent and the weekly report stays due, so both are retried next run.
-        log.warning("review job failed: %s: %s", type(e).__name__, e)
+        # The report stays due, so it is retried on the next run.
+        log.warning("weekly channel numbers failed: %s: %s", type(e).__name__, e)
+
+
+# ---------------------------------------------------------------------------
+# /assignments /brief /write - coursework from the Assignments project on a server (assign.py)
+# ---------------------------------------------------------------------------
+ASSIGN_OFF = "Assignments are not set up: they need server ops (OPS_HOSTS and the ops SSH key) and ASSIGN_HOST."
+ASSIGN_BUTTONS = 8  # assignments that get their own row of buttons under a list
+
+
+def _assign_markup(view: dict) -> InlineKeyboardMarkup | None:
+    rows = []
+    for a in view["upcoming"][:ASSIGN_BUTTONS]:
+        name = a["name"] if len(a["name"]) <= 24 else a["name"][:23].rstrip() + "…"
+        rows.append([
+            InlineKeyboardButton(f"📄 {name}", callback_data=f"as:b:{a['id']}"),
+            InlineKeyboardButton("✍️ Write it", callback_data=f"as:w:{a['id']}"),
+        ])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+def _assign_models(first: str) -> list[dict]:
+    """The models an assignment is written with: the chat's own model, then the fallbacks."""
+    avail = available_models()
+    models = []
+    for key in dict.fromkeys([first, *assign.FALLBACKS]):
+        if key not in avail:
+            continue
+        provider, model_id, label = MODELS[key]
+        models.append({
+            "provider": provider, "model": model_id, "label": re.sub(r"\s*\([^)]*\)$", "", label),
+            "client": None if provider == "ollama" else _oai_client(provider), "url": OLLAMA_BASE_URL,
+        })
+    return models
+
+
+async def _assign_list(bot, chat_id: int, everything: bool = False) -> None:
+    try:
+        view = await assign.listing(everything)
+    except ops.OpsError as e:
+        return await bot.send_message(chat_id, f"Could not read the assignments: {assign.explain(e)}")
+    await send_formatted(bot, chat_id, assign.format_list(view), reply_markup=_assign_markup(view))
+
+
+async def _assign_brief(bot, chat_id: int, assign_id: int) -> None:
+    try:
+        brief = await assign.brief(assign_id)
+    except ops.OpsError as e:
+        return await bot.send_message(chat_id, f"Could not get that brief: {assign.explain(e)}")
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("✍️ Write it", callback_data=f"as:w:{assign_id}")]])
+    await send_formatted(bot, chat_id, assign.format_brief(brief), reply_markup=markup)
+
+
+async def _assign_write(bot, chat_id: int, assign_id: int, notes: str, model_key: str) -> None:
+    """Write one assignment and send the document. Runs as a background task: a local model takes minutes."""
+    if assign.LOCK.locked():
+        await bot.send_message(chat_id, "Another assignment is being written. Send this again when its document arrives.")
+        return
+    async with assign.LOCK:
+        status = await bot.send_message(chat_id, "Reading the assignment…")
+        try:
+            done = await assign.write(assign_id, notes, _assign_models(model_key), partial(_safe_edit, status))
+        except (ops.OpsError, assign.AssignError) as e:
+            return await _safe_edit(status, f"That didn't work: {assign.explain(e)}")
+        except Exception:
+            log.exception("writing assignment %s failed", assign_id)
+            return await _safe_edit(status, "That failed unexpectedly; the details are in the bot log.")
+        due = done["due_text"] + (f" ({done['left']})" if done.get("left") else "")
+        caption = (
+            f"{done['name']} ({done['course_code']})\nDue: {due}\n{done['words']} words, written by {done['model']}\n\n"
+            "A draft for you to review: facts and references are not verified. Nothing was submitted."
+        )
+        try:
+            await bot.send_document(chat_id, InputFile(done["docx"], filename=done["document"]), caption=caption[:1024])
+        except Exception as e:
+            log.exception("could not send the document for assignment %s", assign_id)
+            return await _safe_edit(
+                status, f"The document was built ({done['document']}, on {assign.HOST}) but could not be sent: {e}"
+            )
+        notes_out = list(done["warnings"]) + [f"Tried first, without success: {f}" for f in done["failures"]]
+        if done.get("submitted"):
+            notes_out.append("This assignment is already marked as submitted on the LMS.")
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        if notes_out:
+            await _send_long(bot, chat_id, "Notes:\n" + "\n".join(f"• {n}" for n in notes_out))
+
+
+def _start_write(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, assign_id: int, notes: str = "") -> None:
+    ctx.application.create_task(_assign_write(ctx.bot, chat_id, assign_id, notes, chat_state(chat_id)["model"]))
+
+
+async def cmd_assignments(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return await deny(update)
+    if not assign.AVAILABLE:
+        return await update.effective_message.reply_text(ASSIGN_OFF)
+    await _assign_list(ctx.bot, update.effective_chat.id, everything=bool(ctx.args) and ctx.args[0].lower() == "all")
+
+
+async def cmd_brief(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return await deny(update)
+    if not assign.AVAILABLE:
+        return await update.effective_message.reply_text(ASSIGN_OFF)
+    if len(ctx.args) != 1 or not re.fullmatch(r"\d{1,9}", ctx.args[0]):
+        return await update.effective_message.reply_text("Usage: /brief <assignment id>  (the IDs are in /assignments)")
+    await _assign_brief(ctx.bot, update.effective_chat.id, int(ctx.args[0]))
+
+
+async def cmd_write(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return await deny(update)
+    if not assign.AVAILABLE:
+        return await update.effective_message.reply_text(ASSIGN_OFF)
+    if not ctx.args or not re.fullmatch(r"\d{1,9}", ctx.args[0]):
+        return await update.effective_message.reply_text(
+            "Usage: /write <assignment id> [notes]\n\nThe IDs are in /assignments. Notes are optional: anything the "
+            "writer should know, such as the topic you chose or points to cover."
+        )
+    # The notes are taken from the message itself, so their line breaks survive.
+    notes = update.effective_message.text.split(None, 2)[2] if len(ctx.args) > 1 else ""
+    _start_write(ctx, update.effective_chat.id, int(ctx.args[0]), notes)
+
+
+async def on_assign(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not allowed(update) or not assign.AVAILABLE:
+        return
+    chat_id = query.message.chat_id
+    action = (query.data or "").split(":")[1:]
+    if len(action) != 2 or not re.fullmatch(r"\d{1,9}", action[1]):
+        return
+    if action[0] == "b":
+        await _assign_brief(ctx.bot, chat_id, int(action[1]))
+    elif action[0] == "w":
+        _start_write(ctx, chat_id, int(action[1]))
+
+
+async def assign_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the daily update when it is due, and word of an assignment that appeared with a later sync."""
+    if not OPS_ALERT_CHAT_ID:
+        return
+    try:
+        view = await assign.listing()
+        state = assign.load_state()
+        before = dict(state)
+        text = assign.pending_update(view, state)
+        if text:
+            await send_formatted(ctx.bot, OPS_ALERT_CHAT_ID, text, reply_markup=_assign_markup(view))
+        # Saved only after the message went out, so a failed send is retried on the next check.
+        if state != before:
+            assign.save_state(state)
+    except Exception as e:
+        log.warning("assignment check failed: %s: %s", type(e).__name__, e)
 
 
 # ---------------------------------------------------------------------------
@@ -2609,9 +2777,12 @@ async def post_init(app: Application) -> None:
             BotCommand("autopilot", "Autopilot status, pause or resume a stream"),
             BotCommand("lantern", "Lanternlight queue status and retry"),
             BotCommand("ollama", "Local model server status"),
-            BotCommand("review", "Feedback on videos and reels waiting to go out"),
+            BotCommand("review", "Videos and reels not posted yet, reviewed when you pick one"),
             BotCommand("audit", "Problems the video template repeats"),
             BotCommand("ytstats", "YouTube views per video"),
+            BotCommand("assignments", "Assignments that are due"),
+            BotCommand("brief", "Instructions of one assignment"),
+            BotCommand("write", "Write an assignment as a Word document"),
             BotCommand("about", "About this bot"),
         ]
     )
@@ -2626,8 +2797,14 @@ async def post_init(app: Application) -> None:
             "on" if ops.OPS_AVAILABLE else "off", ", ".join(ops.OPS_HOSTS) or "-", ops.ALERT_MINUTES, OPS_ALERT_CHAT_ID or "-",
         )
         if review.AVAILABLE:
-            app.job_queue.run_repeating(review_job, interval=review.CHECK_MINUTES * 60, first=150)
-        log.info("Video reviews: %s (new items checked every %gm)", "on" if review.AVAILABLE else "off", review.CHECK_MINUTES)
+            app.job_queue.run_repeating(weekly_stats_job, interval=review.WEEKLY_CHECK_MINUTES * 60, first=150)
+        log.info("Video reviews: %s (on request only; weekly channel numbers are sent)", "on" if review.AVAILABLE else "off")
+        if assign.AVAILABLE:
+            app.job_queue.run_repeating(assign_job, interval=assign.CHECK_MINUTES * 60, first=120)
+        log.info(
+            "Assignments: %s (host %s, daily update %s)",
+            "on" if assign.AVAILABLE else "off", assign.HOST or "-", assign.DIGEST_TIME or "off",
+        )
     else:
         log.warning("JobQueue unavailable (install python-telegram-bot[job-queue]); /watch alerts won't auto-run")
     log.info("Available models: %s", list(available_models()))
@@ -2703,6 +2880,10 @@ def main() -> None:
     app.add_handler(CommandHandler("audit", cmd_audit))
     app.add_handler(CommandHandler("ytstats", cmd_ytstats))
     app.add_handler(CallbackQueryHandler(on_review, pattern=r"^rv:"))
+    app.add_handler(CommandHandler(["assignments", "assignment"], cmd_assignments))
+    app.add_handler(CommandHandler("brief", cmd_brief))
+    app.add_handler(CommandHandler("write", cmd_write))
+    app.add_handler(CallbackQueryHandler(on_assign, pattern=r"^as:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.add_error_handler(error_handler)
     log.info("Starting polling…")

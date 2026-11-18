@@ -48,8 +48,8 @@ class OpsError(Exception):
     pass
 
 
-async def call(host: str, verb: str, *args: str, timeout: float = 90) -> dict:
-    """Run one ai-bot-ops verb on a host and return its JSON reply."""
+async def call(host: str, verb: str, *args: str, timeout: float = 90, stdin: str | None = None) -> dict:
+    """Run one ai-bot-ops verb on a host and return its JSON reply. `stdin` is text the verb reads as its input."""
     addr = OPS_HOSTS.get(host)
     if not addr:
         raise OpsError(f"unknown host {host!r}")
@@ -58,7 +58,7 @@ async def call(host: str, verb: str, *args: str, timeout: float = 90) -> dict:
             addr, username=OPS_SSH_USER, client_keys=[OPS_SSH_KEY], known_hosts=OPS_KNOWN_HOSTS,
             agent_path=None, connect_timeout=15,
         ) as conn:
-            result = await asyncio.wait_for(conn.run(" ".join((verb, *args)), check=False), timeout)
+            result = await asyncio.wait_for(conn.run(" ".join((verb, *args)), check=False, input=stdin), timeout)
     except asyncio.TimeoutError:
         raise OpsError(f"{host}: timed out") from None
     except (OSError, ValueError, asyncssh.Error) as e:  # ValueError: bad key file or connection options
